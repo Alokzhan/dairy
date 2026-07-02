@@ -4,16 +4,16 @@
 AppName=Dairy ERP System
 AppVersion=1.0.0
 AppPublisher=Your Company Name
-DefaultDirName={autopf}\DairyERP
+DefaultDirName={userappdata}\DairyERP
 DefaultGroupName=Dairy ERP System
 AllowNoIcons=yes
-OutputDir=installer_output
+OutputDir=E:\dairy\DairyERP\installer_output
 OutputBaseFilename=DairyERP_Setup_v1.0.0
-SetupIconFile=assets\app_icon.ico
+SetupIconFile=E:\dairy\DairyERP\assets\app_icon.ico
 Compression=lzma
 SolidCompression=yes
 WizardStyle=modern
-PrivilegesRequired=admin
+PrivilegesRequired=lowest
 UninstallDisplayIcon={app}\DairyERP.exe
 UninstallDisplayName=Dairy ERP System
 
@@ -24,7 +24,7 @@ Name: "english"; MessagesFile: "compiler:Default.isl"
 Name: "desktopicon"; Description: "Create a Desktop shortcut"; GroupDescription: "Additional Icons:"; Flags: unchecked
 
 [Files]
-Source: "dist\DairyERP\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "E:\dairy\DairyERP\dist\DairyERP\*"; DestDir: "{app}"; Flags: ignoreversion recursesubdirs createallsubdirs
 
 [Dirs]
 Name: "{app}\reports\sales_reports"
@@ -37,7 +37,7 @@ Name: "{app}\backups\database_backups"
 [Icons]
 Name: "{group}\Dairy ERP System"; Filename: "{app}\DairyERP.exe"
 Name: "{group}\Uninstall Dairy ERP"; Filename: "{uninstallexe}"
-Name: "{commondesktop}\Dairy ERP System"; Filename: "{app}\DairyERP.exe"; Tasks: desktopicon
+Name: "{userdesktop}\Dairy ERP System"; Filename: "{app}\DairyERP.exe"; Tasks: desktopicon
 
 [Run]
 Filename: "{app}\DairyERP.exe"; Description: "Launch Dairy ERP System"; Flags: nowait postinstall skipifsilent

@@ -1,4 +1,4 @@
-# main_updated.py — updated for deployment
+# main.py — updated for deployment
 # Ensures all tables are created before GUI starts
 # and sets correct working directory for PyInstaller
 

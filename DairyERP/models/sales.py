@@ -3,7 +3,7 @@ import os
 from datetime import datetime
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-DB_PATH  = os.path.join(BASE_DIR, "dairy.db")
+DB_PATH = os.path.join(BASE_DIR, "dairy.db")
 
 
 def get_connection():
