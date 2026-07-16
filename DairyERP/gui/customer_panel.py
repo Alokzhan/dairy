@@ -177,7 +177,7 @@ class CustomerPanel(ctk.CTkToplevel):
         # Tab 1 — All Customers
         self.tree = self._build_table(
             self.tabview.tab("All Customers"),
-            ("ID", "Name", "Mobile", "Village/City",
+            ("No", "ID", "Name", "Mobile", "Village/City",
              "Type", "Balance", "Due (₹)", "Status")
         )
         self.tree.bind("<<TreeviewSelect>>", self._on_row_select)
@@ -201,7 +201,7 @@ class CustomerPanel(ctk.CTkToplevel):
 
         self.tree_filter = self._build_table(
             filter_tab,
-            ("ID", "Name", "Mobile", "Village/City",
+            ("No", "ID", "Name", "Mobile", "Village/City",
              "Type", "Balance", "Due (₹)", "Status")
         )
 
@@ -255,7 +255,7 @@ class CustomerPanel(ctk.CTkToplevel):
         container.pack(fill="both", expand=True, padx=8, pady=5)
 
         col_widths = {
-            "ID": 45, "Name": 170, "Mobile": 110,
+            "No": 35, "ID": 45, "Name": 170, "Mobile": 110,
             "Village/City": 120, "Type": 130,
             "Balance": 90, "Due (₹)": 90, "Status": 75
         }
@@ -295,7 +295,7 @@ class CustomerPanel(ctk.CTkToplevel):
         if not selected:
             return
         values = self.tree.item(selected, "values")
-        row = get_customer_by_id(int(values[0]))
+        row = get_customer_by_id(int(values[1]))
         if row:
             self._fill_form(row)
 
@@ -553,13 +553,14 @@ class CustomerPanel(ctk.CTkToplevel):
         for item in tree.get_children():
             tree.delete(item)
 
-        for row in rows:
+        for idx, row in enumerate(rows, start=1):
             due    = get_customer_due(row["id"])
             bal    = float(row["current_balance"])
             status = row["status"]
             tag    = "inactive" if status == "Inactive" else ("due" if due > 0 else "")
 
             tree.insert("", "end", tags=(tag,), values=(
+                idx,
                 row["id"],
                 row["name"],
                 row["mobile"],

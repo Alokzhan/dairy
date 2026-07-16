@@ -23,7 +23,6 @@ def ensure_sales_tables():
         conn = get_connection()
         c = conn.cursor()
 
-        # Main bills table
         c.execute("""
             CREATE TABLE IF NOT EXISTS bills (
                 id             INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -47,7 +46,6 @@ def ensure_sales_tables():
             )
         """)
 
-        # Bill items table
         c.execute("""
             CREATE TABLE IF NOT EXISTS bill_items (
                 id          INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -103,9 +101,6 @@ def create_bill(customer_id, customer_name, customer_mobile,
                 cart_items, discount, discount_type,
                 gst_percent, paid_amount, payment_mode, notes=""):
     """
-    cart_items: list of dicts:
-      {product_id, product_name, category, unit, quantity, unit_price, item_discount}
-
     Returns (True, bill_id, invoice_number) or (False, error_message).
     """
     if not cart_items:
@@ -191,6 +186,17 @@ def create_bill(customer_id, customer_name, customer_mobile,
                 SET current_balance = current_balance + ?
                 WHERE id = ?
             """, (due_amount, customer_id))
+
+        # ── FIX: Save paid amount to payments table ──────────
+        # Isse Payment Center aur Customer Payment History me
+        # bill ke waqt diya gaya paid amount dikhega
+        if paid_amount > 0 and customer_id:
+            c.execute("""
+                INSERT INTO payments
+                    (customer_id, amount, payment_date, method, notes)
+                VALUES (?, ?, ?, ?, ?)
+            """, (customer_id, paid_amount, bill_date,
+                  payment_mode, f"Bill payment - {invoice_number}"))
 
         conn.commit()
         return True, bill_id, invoice_number
@@ -278,7 +284,8 @@ def cancel_bill(bill_id):
     try:
         conn = get_connection()
         c = conn.cursor()
-        c.execute("SELECT status, customer_id, due_amount FROM bills WHERE id=?", (bill_id,))
+        c.execute("SELECT status, customer_id, due_amount, paid_amount FROM bills WHERE id=?",
+                  (bill_id,))
         bill = c.fetchone()
         if not bill:
             return False, f"No bill found with ID {bill_id}."
@@ -322,7 +329,11 @@ def record_due_payment(bill_id, amount):
     try:
         conn = get_connection()
         c = conn.cursor()
-        c.execute("SELECT customer_id, due_amount, paid_amount FROM bills WHERE id=?", (bill_id,))
+        c.execute("""
+            SELECT customer_id, due_amount, paid_amount,
+                   payment_mode, invoice_number
+            FROM bills WHERE id=?
+        """, (bill_id,))
         bill = c.fetchone()
         if not bill: return False, f"No bill with ID {bill_id}."
         if amount > float(bill["due_amount"]):
@@ -331,15 +342,27 @@ def record_due_payment(bill_id, amount):
         new_paid = round(float(bill["paid_amount"]) + amount, 2)
         new_due  = round(float(bill["due_amount"])  - amount, 2)
         status   = "Paid" if new_due <= 0 else "Partial"
+        now      = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
         c.execute("""
             UPDATE bills SET paid_amount=?, due_amount=?, status=? WHERE id=?
         """, (new_paid, new_due, status, bill_id))
 
         if bill["customer_id"]:
+            # reduce customer balance
             c.execute("""
                 UPDATE customers SET current_balance=current_balance-? WHERE id=?
             """, (amount, bill["customer_id"]))
+
+            # ── FIX: Save due payment to payments table ──────
+            # Isse Payment Center me due collection bhi dikhega
+            c.execute("""
+                INSERT INTO payments
+                    (customer_id, amount, payment_date, method, notes)
+                VALUES (?, ?, ?, ?, ?)
+            """, (bill["customer_id"], amount, now,
+                  bill["payment_mode"],
+                  f"Due payment - {bill['invoice_number']}"))
 
         conn.commit()
         return True, f"Payment of ₹{amount:,.2f} recorded. Remaining due: ₹{new_due:,.2f}"
@@ -365,17 +388,24 @@ def get_sales_summary(date_from=None, date_to=None):
         if date_to:
             base += " AND DATE(bill_date)<=?"; params.append(date_to)
 
-        c.execute(f"SELECT COUNT(*), COALESCE(SUM(grand_total),0), COALESCE(SUM(paid_amount),0), COALESCE(SUM(due_amount),0) {base}", params)
+        c.execute(f"""
+            SELECT COUNT(*),
+                   COALESCE(SUM(grand_total),0),
+                   COALESCE(SUM(paid_amount),0),
+                   COALESCE(SUM(due_amount),0)
+            {base}
+        """, params)
         r = c.fetchone()
         return {
-            "total_bills":    r[0],
-            "total_revenue":  round(float(r[1]), 2),
-            "total_collected":round(float(r[2]), 2),
-            "total_due":      round(float(r[3]), 2),
+            "total_bills":     r[0],
+            "total_revenue":   round(float(r[1]), 2),
+            "total_collected": round(float(r[2]), 2),
+            "total_due":       round(float(r[3]), 2),
         }
     except sqlite3.Error as e:
         print(f"[get_sales_summary] {e}")
-        return {"total_bills":0,"total_revenue":0.0,"total_collected":0.0,"total_due":0.0}
+        return {"total_bills":0,"total_revenue":0.0,
+                "total_collected":0.0,"total_due":0.0}
     finally:
         if conn: conn.close()
 
@@ -387,9 +417,9 @@ def get_best_selling_products(limit=10):
         c = conn.cursor()
         c.execute("""
             SELECT bi.product_name,
-                   SUM(bi.quantity)  AS total_qty,
-                   SUM(bi.total)     AS total_revenue,
-                   COUNT(DISTINCT bi.bill_id) AS num_bills
+                   SUM(bi.quantity)            AS total_qty,
+                   SUM(bi.total)               AS total_revenue,
+                   COUNT(DISTINCT bi.bill_id)  AS num_bills
             FROM bill_items bi
             JOIN bills b ON bi.bill_id = b.id
             WHERE b.status != 'Cancelled'
@@ -446,7 +476,6 @@ def get_payment_mode_summary():
 
 
 def get_profit_report(date_from=None, date_to=None):
-    """Revenue vs buying cost for sold items."""
     conn = None
     try:
         conn = get_connection()
@@ -454,12 +483,12 @@ def get_profit_report(date_from=None, date_to=None):
         q = """
             SELECT
                 bi.product_name,
-                SUM(bi.quantity)                       AS qty_sold,
-                SUM(bi.total)                          AS revenue,
-                SUM(bi.quantity * p.buying_price)      AS cost,
+                SUM(bi.quantity)                            AS qty_sold,
+                SUM(bi.total)                               AS revenue,
+                SUM(bi.quantity * p.buying_price)           AS cost,
                 SUM(bi.total) - SUM(bi.quantity * p.buying_price) AS profit
             FROM bill_items bi
-            JOIN bills    b ON bi.bill_id    = b.id
+            JOIN bills b ON bi.bill_id = b.id
             LEFT JOIN products p ON bi.product_id = p.id
             WHERE b.status != 'Cancelled'
         """

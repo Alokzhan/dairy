@@ -167,7 +167,7 @@ class EmployeePanel(ctk.CTkToplevel):
         ).pack(pady=(10, 5))
 
         # ttk Treeview (scrollable table)
-        cols = ("ID", "Name", "Phone", "Address", "Role", "Salary", "Joining Date")
+        cols = ("No", "ID", "Name", "Phone", "Address", "Role", "Salary", "Joining Date")
 
         style = ttk.Style()
         style.theme_use("clam")
@@ -202,7 +202,7 @@ class EmployeePanel(ctk.CTkToplevel):
         )
 
         col_widths = {
-            "ID": 50, "Name": 160, "Phone": 110,
+            "No": 35, "ID": 50, "Name": 160, "Phone": 110,
             "Address": 160, "Role": 110,
             "Salary": 90, "Joining Date": 110
         }
@@ -246,18 +246,18 @@ class EmployeePanel(ctk.CTkToplevel):
             return
 
         values = self.tree.item(selected, "values")
-        # values: (ID, Name, Phone, Address, Role, Salary, JoiningDate)
+        # values: (No, ID, Name, Phone, Address, Role, Salary, JoiningDate)
         self.clear_fields()
 
-        self.entry_id.insert(0, values[0])
-        self.entry_name.insert(0, values[1])
-        self.entry_phone.insert(0, values[2])
-        self.entry_address.insert(0, values[3])
-        self.role_var.set(values[4])
-        self.entry_salary.insert(0, values[5])
-        self.entry_joining.insert(0, values[6])
+        self.entry_id.insert(0, values[1])
+        self.entry_name.insert(0, values[2])
+        self.entry_phone.insert(0, values[3])
+        self.entry_address.insert(0, values[4])
+        self.role_var.set(values[5])
+        self.entry_salary.insert(0, values[6])
+        self.entry_joining.insert(0, values[7])
 
-        self._selected_id = values[0]
+        self._selected_id = values[1]
 
     # ==========================
     # ADD EMPLOYEE
@@ -442,8 +442,9 @@ class EmployeePanel(ctk.CTkToplevel):
         for item in self.tree.get_children():
             self.tree.delete(item)
 
-        for row in rows:
+        for idx, row in enumerate(rows, start=1):
             self.tree.insert("", "end", values=(
+                idx,
                 row["id"],
                 row["name"],
                 row["phone"],

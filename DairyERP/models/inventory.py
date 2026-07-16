@@ -138,7 +138,7 @@ def get_current_stock():
                    p.buying_price, p.selling_price,
                    ROUND(p.quantity * p.buying_price, 2) AS stock_value
             FROM products p
-            ORDER BY p.category ASC, p.name ASC
+            ORDER BY p.id ASC
         """)
         return c.fetchall()
     except sqlite3.Error as e:

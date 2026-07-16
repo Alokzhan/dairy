@@ -117,10 +117,10 @@ class InventoryPanel(ctk.CTkToplevel):
                       command=self._cs_load_all).pack(side="left")
 
         # table
-        cols = ("ID", "Product Name", "Category", "Unit",
+        cols = ("No", "ID", "Product Name", "Category", "Unit",
                 "Stock", "Buy Price", "Sell Price", "Stock Value")
         self.cs_tree = self._make_tree(tab, cols,
-            {"ID":45,"Product Name":180,"Category":100,"Unit":65,
+            {"No":35,"ID":45,"Product Name":180,"Category":100,"Unit":65,
              "Stock":80,"Buy Price":90,"Sell Price":90,"Stock Value":100})
 
         self.cs_tree.bind("<<TreeviewSelect>>", self._cs_on_select)
@@ -153,14 +153,14 @@ class InventoryPanel(ctk.CTkToplevel):
     def _fill_cs_tree(self, rows):
         for i in self.cs_tree.get_children():
             self.cs_tree.delete(i)
-        for r in rows:
+        for idx, r in enumerate(rows, start=1):
             qty = float(r["current_stock"]) if "current_stock" in r.keys() else float(r["quantity"])
             tag = "out" if qty <= 0 else ("low" if qty <= 10 else "normal")
             bp  = float(r["buying_price"])
             sp  = float(r["selling_price"])
             sv  = round(qty * bp, 2)
             self.cs_tree.insert("", "end", tags=(tag,), values=(
-                r["id"], r["name"], r["category"], r["unit"],
+                idx, r["id"], r["name"], r["category"], r["unit"],
                 f"{qty:g}", f"₹{bp:,.2f}", f"₹{sp:,.2f}", f"₹{sv:,.2f}"
             ))
 
@@ -168,12 +168,12 @@ class InventoryPanel(ctk.CTkToplevel):
         sel = self.cs_tree.focus()
         if not sel: return
         vals = self.cs_tree.item(sel, "values")
-        self._selected_product_id   = int(vals[0])
-        self._selected_product_name = vals[1]
-        txt = f"✅ Selected: [{vals[0]}] {vals[1]}  |  Current Stock: {vals[4]} {vals[3]}"
+        self._selected_product_id   = int(vals[1])
+        self._selected_product_name = vals[2]
+        txt = f"✅ Selected: [{vals[1]}] {vals[2]}  |  Current Stock: {vals[5]} {vals[4]}"
         self.cs_selected_lbl.configure(text=txt, text_color="#1976D2")
         # auto-fill product in Stock In / Out / Adjustment tabs
-        self._autofill_product(vals[0], vals[1], vals[4], vals[3])
+        self._autofill_product(vals[1], vals[2], vals[5], vals[4])
 
     def _autofill_product(self, pid, name, stock, unit):
         for entry, val in [

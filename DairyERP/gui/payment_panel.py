@@ -10,19 +10,25 @@ from models.payment import (
     get_salary_payments,
     delete_salary_payment,
     get_employee_salary_status,
-    record_distributor_payment,
-    get_distributor_payments,
-    delete_distributor_payment,
+    get_employee_salary_ledger,
     get_employees_for_payment,
-    get_distributors_for_payment,
     get_payment_dashboard_summary
+)
+
+from models.production_incentive import (
+    ensure_incentive_tables,
+    get_production_rates,
+    set_production_rates,
+    get_employee_incentive_status,
+    record_incentive_payment,
+    get_incentive_payment_history,
+    delete_incentive_payment,
 )
 
 from DairyERP.utils.report_exporter import export_to_excel, export_to_pdf
 
 PAYMENT_MODES = ["Cash", "UPI", "Card", "Bank Transfer", "Cheque"]
 PAY_PERIODS   = ["This Month", "Advance", "Bonus", "Arrears", "Other"]
-DIST_TYPES    = ["Payment Made", "Payment Received"]
 
 
 class PaymentPanel(ctk.CTkToplevel):
@@ -34,9 +40,9 @@ class PaymentPanel(ctk.CTkToplevel):
         self.resizable(True, True)
 
         ensure_payment_tables()
+        ensure_incentive_tables()
 
-        self._employees    = []
-        self._distributors = []
+        self._employees = []
 
         self._build_ui()
         self.after(100, self._refresh_dashboard)
@@ -58,17 +64,16 @@ class PaymentPanel(ctk.CTkToplevel):
         self.s_collected = self._stat(dash, "💰 Collected Today",      "₹0", "#2E7D32")
         self.s_cust_due  = self._stat(dash, "⏳ Customer Dues",        "₹0", "#C62828")
         self.s_salary    = self._stat(dash, "👨‍💼 Salary Paid (Month)", "₹0", "#1565C0")
-        self.s_dist_owed = self._stat(dash, "🚚 Owed to Distributors", "₹0", "#E65100")
 
         self.tabs = ctk.CTkTabview(self)
         self.tabs.pack(fill="both", expand=True, padx=20, pady=(0, 10))
 
-        for t in ["👥 Customer Payments", "👨‍💼 Salary Payments", "🚚 Distributor Payments"]:
+        for t in ["👥 Customer Payments", "👨‍💼 Salary Payments", "🏭 Production Incentive"]:
             self.tabs.add(t)
 
         self._build_customer_tab()
         self._build_salary_tab()
-        self._build_distributor_tab()
+        self._build_incentive_tab()
 
     def _stat(self, parent, label, val, color):
         f = ctk.CTkFrame(parent, fg_color=color, corner_radius=8)
@@ -238,6 +243,12 @@ class PaymentPanel(ctk.CTkToplevel):
         )
         self.lbl_sal_status.pack(padx=10, pady=10)
 
+        ctk.CTkButton(
+            scroll, text="📊 View Monthly Salary Ledger", width=370,
+            fg_color="#455A64", hover_color="#263238",
+            command=self._show_salary_ledger
+        ).pack(padx=8, pady=(0,8))
+
         self._lbl(scroll, "💵 Amount to Pay (₹) *")
         self.sal_amount = ctk.CTkEntry(scroll, width=370, placeholder_text="0.00")
         self.sal_amount.pack(padx=8, pady=(0,8))
@@ -305,18 +316,70 @@ class PaymentPanel(ctk.CTkToplevel):
 
     def _on_employee_select(self, value):
         if value == "Select Employee":
-            self.lbl_sal_status.configure(text="Select an employee to see salary status")
+            self.lbl_sal_status.configure(
+                text="Select an employee to see salary status")
             return
         emp_id = self._get_employee_id(value)
         if emp_id:
             status = get_employee_salary_status(emp_id)
-            self.lbl_sal_status.configure(
-                text=(f"Monthly Salary: ₹{status['monthly_salary']:,.2f}\n"
-                     f"Paid This Month: ₹{status['paid_this_month']:,.2f}\n"
-                     f"Balance Due: ₹{status['balance']:,.2f}")
-            )
-            color = "#1565C0" if status['balance'] <= 0 else "#E65100"
+
+            def line(label, amt):
+                return f"{label:<20}₹{amt:,.2f}"
+
+            sep = "─" * 32
+            rows = [line("Monthly Salary", status['monthly_salary']), sep,
+                    line("This Month Paid", status['paid_this_month'])]
+            if status['advance_paid']:
+                rows.append(line("Advance Paid", status['advance_paid']))
+            rows.append(line("Remaining This Month", status['remaining_this_month']))
+            if status['old_due_remaining']:
+                rows.append(sep)
+                rows.append(line("Old Due (Pending)", status['old_due_remaining']))
+            if status['arrears_paid_total']:
+                rows.append(line("Arrears Paid (All Time)", status['arrears_paid_total']))
+            if status['bonus_paid']:
+                rows.append(sep)
+                rows.append(line("Bonus Paid (No effect on due)", status['bonus_paid']))
+            rows.append(sep)
+            rows.append(line("Total Balance Due", status['balance']))
+
+            self.lbl_sal_status.configure(text="\n".join(rows), justify="left")
+            color = "#2E7D32" if status['balance'] <= 0 else "#E65100"
             self.sal_status_box.configure(fg_color=color)
+
+    def _show_salary_ledger(self):
+        emp_val = self.sal_emp_var.get()
+        if emp_val == "Select Employee":
+            messagebox.showwarning("⚠️", "Select an employee first.")
+            return
+        emp_id = self._get_employee_id(emp_val)
+        emp_name = emp_val.split(" (")[0]
+        ledger = get_employee_salary_ledger(emp_id)
+
+        win = ctk.CTkToplevel(self)
+        win.title(f"Monthly Salary Ledger — {emp_name}")
+        win.geometry("720x420")
+
+        ctk.CTkLabel(win, text=f"📊 Monthly Salary Ledger — {emp_name}",
+                     font=("Arial", 15, "bold")).pack(pady=(12, 6))
+
+        cols = ("Month", "Salary", "This Month Paid", "Advance", "Arrears", "Bonus", "Balance")
+        cw = {"Month": 90, "Salary": 90, "This Month Paid": 120,
+              "Advance": 90, "Arrears": 90, "Bonus": 80, "Balance": 90}
+        tree = self._make_tree(win, cols, cw, height=12)
+
+        if not ledger:
+            ctk.CTkLabel(win, text="No salary payment history found for this employee.",
+                         text_color="gray").pack(pady=6)
+            return
+
+        for m in ledger:
+            tree.insert("", "end", values=(
+                m["month"], f"₹{m['monthly_salary']:,.0f}",
+                f"₹{m['this_month_paid']:,.0f}", f"₹{m['advance_paid']:,.0f}",
+                f"₹{m['arrears_paid']:,.0f}", f"₹{m['bonus_paid']:,.0f}",
+                f"₹{m['balance']:,.0f}"
+            ))
 
     def _pay_salary(self):
         emp_val = self.sal_emp_var.get()
@@ -393,11 +456,11 @@ class PaymentPanel(ctk.CTkToplevel):
         )
 
     # ════════════════════════════════════════
-    # TAB 3 — DISTRIBUTOR PAYMENTS
+    # TAB 3 — PRODUCTION INCENTIVE (Cream/Ghee output-based pay)
     # ════════════════════════════════════════
 
-    def _build_distributor_tab(self):
-        tab = self.tabs.tab("🚚 Distributor Payments")
+    def _build_incentive_tab(self):
+        tab = self.tabs.tab("🏭 Production Incentive")
         tab.columnconfigure(0, weight=2)
         tab.columnconfigure(1, weight=3)
         tab.rowconfigure(0, weight=1)
@@ -405,184 +468,238 @@ class PaymentPanel(ctk.CTkToplevel):
         left = ctk.CTkFrame(tab)
         left.grid(row=0, column=0, sticky="nsew", padx=(0,6), pady=4)
 
-        scroll = ctk.CTkScrollableFrame(left, label_text="🚚 Distributor Payment",
+        scroll = ctk.CTkScrollableFrame(left, label_text="🏭 Pay Production Incentive",
                                         label_font=("Arial", 14, "bold"))
         scroll.pack(fill="both", expand=True, padx=4, pady=4)
 
-        self._lbl(scroll, "🚚 Distributor")
-        self.dist_var = ctk.StringVar(value="Select Distributor")
-        self.dist_menu = ctk.CTkOptionMenu(
-            scroll, variable=self.dist_var,
-            values=["Select Distributor"], width=370,
-            command=self._on_distributor_select
+        rates = get_production_rates()
+        self.rate_lbl = ctk.CTkLabel(
+            scroll,
+            text=(f"Current Rates —  Cream: ₹{rates['cream_rate_per_kg']:,.2f}/kg   "
+                  f"Ghee: ₹{rates['ghee_rate_per_kg']:,.2f}/kg"),
+            font=("Arial", 11), text_color="gray"
         )
-        self.dist_menu.pack(padx=8, pady=(0,8))
-        self._load_distributors()
+        self.rate_lbl.pack(padx=8, pady=(4,0))
 
-        self.dist_status_box = ctk.CTkFrame(scroll, fg_color="#E65100", corner_radius=8)
-        self.dist_status_box.pack(fill="x", padx=8, pady=6)
-        self.lbl_dist_status = ctk.CTkLabel(
-            self.dist_status_box,
-            text="Select a distributor to see balance",
-            font=("Arial", 11), text_color="white"
+        ctk.CTkButton(scroll, text="⚙️ Set Cream/Ghee Rates", width=370,
+                      fg_color="#455A64", hover_color="#263238",
+                      command=self._open_rate_settings).pack(padx=8, pady=(4,8))
+
+        self._lbl(scroll, "👨‍💼 Employee (Operator)")
+        self.inc_emp_var = ctk.StringVar(value="Select Employee")
+        self.inc_emp_menu = ctk.CTkOptionMenu(
+            scroll, variable=self.inc_emp_var,
+            values=["Select Employee"], width=370,
+            command=self._on_incentive_employee_select
         )
-        self.lbl_dist_status.pack(padx=10, pady=10)
+        self.inc_emp_menu.pack(padx=8, pady=(0,8))
+        # employees already loaded by _build_salary_tab -> self._employees
+        emp_names = ["Select Employee"] + [f"{e['name']} ({e['role']})" for e in self._employees]
+        self.inc_emp_menu.configure(values=emp_names)
 
-        self._lbl(scroll, "📋 Payment Type")
-        self.dist_type_var = ctk.StringVar(value="Payment Made")
-        ctk.CTkOptionMenu(scroll, variable=self.dist_type_var,
-                          values=DIST_TYPES, width=370).pack(padx=8, pady=(0,8))
-
-        self._lbl(scroll, "💵 Amount (₹) *")
-        self.dist_amount = ctk.CTkEntry(scroll, width=370, placeholder_text="0.00")
-        self.dist_amount.pack(padx=8, pady=(0,8))
+        self.inc_status_box = ctk.CTkFrame(scroll, fg_color="#00695C", corner_radius=8)
+        self.inc_status_box.pack(fill="x", padx=8, pady=6)
+        self.lbl_inc_status = ctk.CTkLabel(
+            self.inc_status_box,
+            text="Select an employee to see production & unpaid amount",
+            font=("Arial", 11), text_color="white", justify="left"
+        )
+        self.lbl_inc_status.pack(padx=10, pady=10)
 
         self._lbl(scroll, "💳 Payment Mode")
-        self.dist_mode_var = ctk.StringVar(value="Cash")
-        ctk.CTkOptionMenu(scroll, variable=self.dist_mode_var,
+        self.inc_mode_var = ctk.StringVar(value="Cash")
+        ctk.CTkOptionMenu(scroll, variable=self.inc_mode_var,
                           values=PAYMENT_MODES, width=370).pack(padx=8, pady=(0,8))
 
         self._lbl(scroll, "📝 Notes")
-        self.dist_notes = ctk.CTkEntry(scroll, width=370, placeholder_text="Optional")
-        self.dist_notes.pack(padx=8, pady=(0,8))
+        self.inc_notes = ctk.CTkEntry(scroll, width=370, placeholder_text="Optional")
+        self.inc_notes.pack(padx=8, pady=(0,8))
 
         ctk.CTkButton(
-            scroll, text="✅  Record Payment",
-            fg_color="#E65100", hover_color="#BF360C",
+            scroll, text="✅  Pay Unpaid Production Amount",
+            fg_color="#00695C", hover_color="#004D40",
             width=370, height=42, font=("Arial", 14, "bold"),
-            command=self._pay_distributor
+            command=self._pay_incentive
         ).pack(padx=8, pady=8)
 
+        # RIGHT — history table
         right = ctk.CTkFrame(tab)
         right.grid(row=0, column=1, sticky="nsew", padx=(6,0), pady=4)
 
-        ctk.CTkLabel(right, text="📜 Distributor Payment History",
+        ctk.CTkLabel(right, text="📜 Production Incentive Payment History",
                      font=("Arial", 14, "bold")).pack(pady=(10,4))
 
         frow = ctk.CTkFrame(right, fg_color="transparent")
         frow.pack(fill="x", padx=10, pady=4)
         ctk.CTkLabel(frow, text="From:").pack(side="left", padx=(0,4))
-        self.dp_from = ctk.CTkEntry(frow, width=110, placeholder_text="YYYY-MM-DD")
-        self.dp_from.pack(side="left", padx=(0,8))
+        self.inc_from = ctk.CTkEntry(frow, width=110, placeholder_text="YYYY-MM-DD")
+        self.inc_from.pack(side="left", padx=(0,8))
         ctk.CTkLabel(frow, text="To:").pack(side="left", padx=(0,4))
-        self.dp_to = ctk.CTkEntry(frow, width=110, placeholder_text="YYYY-MM-DD")
-        self.dp_to.pack(side="left", padx=(0,8))
+        self.inc_to = ctk.CTkEntry(frow, width=110, placeholder_text="YYYY-MM-DD")
+        self.inc_to.pack(side="left", padx=(0,8))
         ctk.CTkButton(frow, text="🔍 Filter", width=80,
-                      command=self._load_distributor_history).pack(side="left", padx=4)
+                      command=self._load_incentive_history).pack(side="left", padx=4)
         ctk.CTkButton(frow, text="🔄 All", width=70,
                       fg_color="#4CAF50", hover_color="#1B5E20",
-                      command=lambda: self._load_distributor_history(clear=True)).pack(side="left")
+                      command=lambda: self._load_incentive_history(clear=True)).pack(side="left")
 
-        dp_cols = ("ID","Date","Distributor","Amount","Type","Mode","Notes")
-        dp_cw = {"ID":40,"Date":140,"Distributor":150,"Amount":90,
-                 "Type":120,"Mode":90,"Notes":160}
-        self.dp_tree = self._make_tree(right, dp_cols, dp_cw)
+        inc_cols = ("ID","Date","Employee","Cream Kg","Ghee Kg","Cream Rate","Ghee Rate","Amount","Mode","Notes")
+        inc_cw = {"ID":40,"Date":135,"Employee":120,"Cream Kg":80,"Ghee Kg":80,
+                  "Cream Rate":85,"Ghee Rate":85,"Amount":90,"Mode":85,"Notes":140}
+        self.inc_tree = self._make_tree(right, inc_cols, inc_cw)
 
         arow = ctk.CTkFrame(right, fg_color="transparent")
         arow.pack(fill="x", padx=10, pady=6)
         ctk.CTkButton(arow, text="🗑️ Delete Selected", width=140,
                       fg_color="#C62828", hover_color="#8E0000",
-                      command=self._delete_distributor_payment).pack(side="left", padx=4)
+                      command=self._delete_incentive_payment).pack(side="left", padx=4)
         ctk.CTkButton(arow, text="📊 Export Excel", width=140,
                       fg_color="#1D6F42", hover_color="#14502F",
-                      command=self._export_dist_excel).pack(side="left", padx=4)
+                      command=self._export_incentive_excel).pack(side="left", padx=4)
         ctk.CTkButton(arow, text="📄 Export PDF", width=140,
                       fg_color="#C62828", hover_color="#8E0000",
-                      command=self._export_dist_pdf).pack(side="left", padx=4)
+                      command=self._export_incentive_pdf).pack(side="left", padx=4)
 
-        self._load_distributor_history(clear=True)
+        self._load_incentive_history(clear=True)
 
-    def _on_distributor_select(self, value):
-        if value == "Select Distributor":
-            self.lbl_dist_status.configure(text="Select a distributor to see balance")
+    def _open_rate_settings(self):
+        rates = get_production_rates()
+        win = ctk.CTkToplevel(self)
+        win.title("Set Cream/Ghee Rates")
+        win.geometry("360x260")
+        win.grab_set()
+
+        ctk.CTkLabel(win, text="⚙️ Production Incentive Rates",
+                     font=("Arial", 14, "bold")).pack(pady=(14,8))
+
+        ctk.CTkLabel(win, text="Cream Rate (₹ per Kg)").pack(anchor="w", padx=20)
+        cream_entry = ctk.CTkEntry(win, width=300)
+        cream_entry.insert(0, str(rates["cream_rate_per_kg"]))
+        cream_entry.pack(padx=20, pady=(0,10))
+
+        ctk.CTkLabel(win, text="Ghee Rate (₹ per Kg)").pack(anchor="w", padx=20)
+        ghee_entry = ctk.CTkEntry(win, width=300)
+        ghee_entry.insert(0, str(rates["ghee_rate_per_kg"]))
+        ghee_entry.pack(padx=20, pady=(0,10))
+
+        def save():
+            success, msg = set_production_rates(cream_entry.get(), ghee_entry.get())
+            if success:
+                messagebox.showinfo("✅", msg)
+                new_rates = get_production_rates()
+                self.rate_lbl.configure(
+                    text=(f"Current Rates —  Cream: ₹{new_rates['cream_rate_per_kg']:,.2f}/kg   "
+                          f"Ghee: ₹{new_rates['ghee_rate_per_kg']:,.2f}/kg"))
+                # refresh currently selected employee's status with new rates
+                self._on_incentive_employee_select(self.inc_emp_var.get())
+                win.destroy()
+            else:
+                messagebox.showerror("❌", msg)
+
+        ctk.CTkButton(win, text="💾 Save Rates", fg_color="#00695C",
+                      hover_color="#004D40", command=save).pack(pady=12)
+
+    def _on_incentive_employee_select(self, value):
+        if value == "Select Employee":
+            self.lbl_inc_status.configure(
+                text="Select an employee to see production & unpaid amount")
             return
-        for d in self._distributors:
-            if value.startswith(d["name"]):
-                bal = float(d["balance"])
-                txt = f"Current Balance Owed: ₹{bal:,.2f}" if bal >= 0 else \
-                      f"They owe us: ₹{abs(bal):,.2f}"
-                self.lbl_dist_status.configure(text=txt)
-                color = "#E65100" if bal > 0 else "#2E7D32"
-                self.dist_status_box.configure(fg_color=color)
-                break
+        emp_id = self._get_employee_id(value)
+        if emp_id:
+            status = get_employee_incentive_status(emp_id)
 
-    def _pay_distributor(self):
-        val = self.dist_var.get()
-        if val == "Select Distributor":
-            messagebox.showwarning("⚠️", "Select a distributor.")
+            def line(label, val, is_amt=True):
+                v = f"₹{val:,.2f}" if is_amt else f"{val:,.2f} kg"
+                return f"{label:<22}{v}"
+
+            sep = "─" * 34
+            rows = [
+                line("Cream Produced (Total)", status['cream_produced'], False),
+                line("Ghee Produced (Total)",  status['ghee_produced'], False),
+                sep,
+                line("Cream Already Paid",     status['cream_paid'], False),
+                line("Ghee Already Paid",      status['ghee_paid'], False),
+                sep,
+                line("Unpaid Cream",           status['unpaid_cream'], False),
+                line("Unpaid Ghee",            status['unpaid_ghee'], False),
+                sep,
+                line("Amount Payable",         status['amount_payable']),
+            ]
+            self.lbl_inc_status.configure(text="\n".join(rows), justify="left")
+            color = "#455A64" if status['amount_payable'] <= 0 else "#00695C"
+            self.inc_status_box.configure(fg_color=color)
+
+    def _pay_incentive(self):
+        emp_val = self.inc_emp_var.get()
+        if emp_val == "Select Employee":
+            messagebox.showwarning("⚠️", "Select an employee.")
             return
-        dist_id = None
-        dist_name = val.split(" (")[0]
-        for d in self._distributors:
-            if val.startswith(d["name"]):
-                dist_id = d["id"]; break
+        emp_id = self._get_employee_id(emp_val)
+        emp_name = emp_val.split(" (")[0]
 
-        success, result = record_distributor_payment(
-            dist_id, dist_name,
-            self.dist_amount.get(),
-            self.dist_type_var.get(),
-            self.dist_mode_var.get(),
-            self.dist_notes.get()
+        success, result = record_incentive_payment(
+            emp_id, emp_name,
+            self.inc_mode_var.get(),
+            self.inc_notes.get()
         )
         if success:
-            messagebox.showinfo("✅ Success", f"Payment recorded! (ID: {result})")
-            self.dist_amount.delete(0, "end")
-            self.dist_notes.delete(0, "end")
-            self._load_distributors()
-            self._load_distributor_history(clear=True)
-            self._on_distributor_select(val)
-            self._refresh_dashboard()
+            messagebox.showinfo("✅ Success", f"Incentive payment recorded! (ID: {result})")
+            self.inc_notes.delete(0, "end")
+            self._load_incentive_history(clear=True)
+            self._on_incentive_employee_select(emp_val)
         else:
-            messagebox.showerror("❌ Error", result)
+            messagebox.showwarning("⚠️", result)
 
-    def _load_distributor_history(self, clear=False):
+    def _load_incentive_history(self, clear=False):
         if clear:
-            self.dp_from.delete(0, "end")
-            self.dp_to.delete(0, "end")
+            self.inc_from.delete(0, "end")
+            self.inc_to.delete(0, "end")
 
-        self._dp_rows = get_distributor_payments(
-            date_from=self.dp_from.get().strip() or None,
-            date_to=self.dp_to.get().strip() or None
+        self._inc_rows = get_incentive_payment_history(
+            date_from=self.inc_from.get().strip() or None,
+            date_to=self.inc_to.get().strip() or None
         )
-        for i in self.dp_tree.get_children(): self.dp_tree.delete(i)
-        for r in self._dp_rows:
-            self.dp_tree.insert("", "end", values=(
-                r["id"], r["payment_date"], r["distributor_name"],
-                f"₹{float(r['amount']):,.2f}", r["payment_type"],
-                r["payment_mode"], r["notes"] or ""
+        for i in self.inc_tree.get_children(): self.inc_tree.delete(i)
+        for r in self._inc_rows:
+            self.inc_tree.insert("", "end", values=(
+                r["id"], r["payment_date"], r["employee_name"],
+                f"{float(r['cream_qty']):,.2f}", f"{float(r['ghee_qty']):,.2f}",
+                f"₹{float(r['cream_rate']):,.2f}", f"₹{float(r['ghee_rate']):,.2f}",
+                f"₹{float(r['amount']):,.2f}", r["payment_mode"], r["notes"] or ""
             ))
 
-    def _delete_distributor_payment(self):
-        sel = self.dp_tree.focus()
+    def _delete_incentive_payment(self):
+        sel = self.inc_tree.focus()
         if not sel:
             messagebox.showwarning("⚠️", "Select a record to delete.")
             return
-        pid = int(self.dp_tree.item(sel, "values")[0])
-        if not messagebox.askyesno("⚠️ Confirm", f"Delete payment ID {pid}?"):
+        pid = int(self.inc_tree.item(sel, "values")[0])
+        if not messagebox.askyesno("⚠️ Confirm",
+                f"Delete incentive payment ID {pid}?\nThat quantity will become unpaid again."):
             return
-        success, msg = delete_distributor_payment(pid)
+        success, msg = delete_incentive_payment(pid)
         if success:
             messagebox.showinfo("✅", msg)
-            self._load_distributors()
-            self._load_distributor_history(clear=True)
-            self._refresh_dashboard()
+            self._load_incentive_history(clear=True)
+            self._on_incentive_employee_select(self.inc_emp_var.get())
         else:
             messagebox.showerror("❌", msg)
 
-    def _export_dist_excel(self):
+    def _export_incentive_excel(self):
         export_to_excel(
-            data=self._dp_rows,
-            columns=["ID","Date","Distributor","Amount","Type","Mode","Notes"],
-            keys=["id","payment_date","distributor_name","amount","payment_type","payment_mode","notes"],
-            filename="Distributor_Payments_Report", title="Distributor Payments Report"
+            data=self._inc_rows,
+            columns=["ID","Date","Employee","Cream Kg","Ghee Kg","Cream Rate","Ghee Rate","Amount","Mode","Notes"],
+            keys=["id","payment_date","employee_name","cream_qty","ghee_qty",
+                  "cream_rate","ghee_rate","amount","payment_mode","notes"],
+            filename="Production_Incentive_Report", title="Production Incentive Payments Report"
         )
 
-    def _export_dist_pdf(self):
+    def _export_incentive_pdf(self):
         export_to_pdf(
-            data=self._dp_rows,
-            columns=["Date","Distributor","Amount","Type","Mode"],
-            keys=["payment_date","distributor_name","amount","payment_type","payment_mode"],
-            filename="Distributor_Payments_Report", title="Distributor Payments Report"
+            data=self._inc_rows,
+            columns=["Date","Employee","Cream Kg","Ghee Kg","Amount"],
+            keys=["payment_date","employee_name","cream_qty","ghee_qty","amount"],
+            filename="Production_Incentive_Report", title="Production Incentive Payments Report"
         )
 
     # ════════════════════════════════════════
@@ -594,7 +711,6 @@ class PaymentPanel(ctk.CTkToplevel):
         self.s_collected.configure(text=f"₹{s['collected_today']:,.2f}")
         self.s_cust_due.configure(text=f"₹{s['total_customer_due']:,.2f}")
         self.s_salary.configure(text=f"₹{s['salary_paid_month']:,.2f}")
-        self.s_dist_owed.configure(text=f"₹{s['distributor_owed']:,.2f}")
 
     # ════════════════════════════════════════
     # HELPERS
@@ -609,20 +725,14 @@ class PaymentPanel(ctk.CTkToplevel):
         names = ["Select Employee"] + [f"{e['name']} ({e['role']})" for e in self._employees]
         self.sal_emp_menu.configure(values=names)
         self.sal_emp_var.set("Select Employee")
+        if hasattr(self, "inc_emp_menu"):
+            self.inc_emp_menu.configure(values=names)
 
     def _get_employee_id(self, display_val):
         for e in self._employees:
             if display_val.startswith(e["name"]):
                 return e["id"]
         return None
-
-    def _load_distributors(self):
-        self._distributors = get_distributors_for_payment()
-        names = ["Select Distributor"] + [
-            f"{d['name']} (Bal: ₹{float(d['balance']):,.0f})" for d in self._distributors
-        ]
-        self.dist_menu.configure(values=names)
-        self.dist_var.set("Select Distributor")
 
     def _make_tree(self, parent, cols, col_widths, height=14):
         style = ttk.Style()

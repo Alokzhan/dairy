@@ -13,6 +13,21 @@ def get_connection():
     return conn
 
 
+def _reset_autoincrement_if_empty(cursor, table_name):
+    """
+    Agar table ke sab records delete ho chuke hain, to sqlite_sequence
+    se us table ki entry hata do — taaki agla INSERT ID=1 se shuru ho,
+    AUTOINCREMENT ke purane high-water-mark se continue na kare.
+    Sirf pura table khali hone par hi reset hota hai; agar beech ke
+    kisi ek record ko delete kiya gaya ho (aur baaki records maujood
+    hain), to koi reset nahi hota — audit trail ke liye baaki IDs
+    stable rehte hain.
+    """
+    cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
+    if cursor.fetchone()[0] == 0:
+        cursor.execute("DELETE FROM sqlite_sequence WHERE name=?", (table_name,))
+
+
 # ==========================
 # ENSURE TABLES
 # ==========================
@@ -23,7 +38,7 @@ def ensure_payment_tables():
         conn = get_connection()
         c = conn.cursor()
 
-        # Generic payments ledger — covers salary, distributor, misc payments
+        # Generic payments ledger — covers salary and misc payments
         # (customer payments already exist via bills/payments tables from Sales module)
         c.execute("""
             CREATE TABLE IF NOT EXISTS salary_payments (
@@ -36,20 +51,6 @@ def ensure_payment_tables():
                 payment_mode  TEXT    DEFAULT 'Cash',
                 notes         TEXT,
                 FOREIGN KEY (employee_id) REFERENCES employees(id)
-            )
-        """)
-
-        c.execute("""
-            CREATE TABLE IF NOT EXISTS distributor_payments (
-                id              INTEGER PRIMARY KEY AUTOINCREMENT,
-                distributor_id  INTEGER NOT NULL,
-                distributor_name TEXT   NOT NULL,
-                amount          REAL    NOT NULL,
-                payment_type    TEXT    DEFAULT 'Payment Made',
-                payment_date    TEXT    NOT NULL,
-                payment_mode    TEXT    DEFAULT 'Cash',
-                notes           TEXT,
-                FOREIGN KEY (distributor_id) REFERENCES distributors(id)
             )
         """)
 
@@ -179,6 +180,7 @@ def delete_salary_payment(payment_id):
         if not c.fetchone():
             return False, f"No payment found with ID {payment_id}."
         c.execute("DELETE FROM salary_payments WHERE id=?", (payment_id,))
+        _reset_autoincrement_if_empty(c, "salary_payments")
         conn.commit()
         return True, "Salary payment record deleted."
     except sqlite3.Error as e:
@@ -187,8 +189,47 @@ def delete_salary_payment(payment_id):
         if conn: conn.close()
 
 
+def _fetch_monthly_period_totals(cursor, employee_id):
+    """
+    Employee ke sab salary_payments ko (year-month, pay_period) ke
+    hisaab se group karke ek nested dict banata hai:
+        { "2026-07": {"This Month": 70000, "Advance": 0, ...}, ... }
+    Isi ek query se current-month aur ledger dono banate hain.
+    """
+    cursor.execute("""
+        SELECT strftime('%Y-%m', payment_date) AS ym,
+               pay_period, COALESCE(SUM(amount),0) AS total
+        FROM salary_payments
+        WHERE employee_id=?
+        GROUP BY ym, pay_period
+        ORDER BY ym
+    """, (employee_id,))
+
+    by_month = {}
+    for r in cursor.fetchall():
+        ym = r["ym"]
+        period = r["pay_period"] or "Other"
+        if period not in ("This Month", "Advance", "Arrears", "Bonus"):
+            period = "Other"
+        by_month.setdefault(ym, {"This Month": 0.0, "Advance": 0.0,
+                                  "Arrears": 0.0, "Bonus": 0.0, "Other": 0.0})
+        by_month[ym][period] += float(r["total"])
+    return by_month
+
+
 def get_employee_salary_status(employee_id):
-    """Returns total salary, total paid, balance due for this employee."""
+    """
+    Professional payroll logic:
+
+    - Advance us mahine ki salary ko turant reduce karta hai jis mahine
+      me wo record kiya gaya ho (This Month + Advance dono current month
+      ki salary ko cover karte hain).
+    - Arrears kabhi bhi current month ya Bonus se mix nahi hota — wo
+      sirf purane (pichhle) mahino ke accumulated unpaid due ko clear
+      karta hai.
+    - Bonus fully independent hai — Salary Due, Advance ya Arrear pe
+      koi asar nahi dalta.
+    """
     conn = None
     try:
         conn = get_connection()
@@ -197,112 +238,96 @@ def get_employee_salary_status(employee_id):
         row = c.fetchone()
         monthly_salary = float(row["salary"]) if row else 0.0
 
-        c.execute("""
-            SELECT COALESCE(SUM(amount),0) FROM salary_payments
-            WHERE employee_id=? AND strftime('%Y-%m', payment_date) = strftime('%Y-%m','now')
-        """, (employee_id,))
-        paid_this_month = float(c.fetchone()[0])
+        by_month = _fetch_monthly_period_totals(c, employee_id)
+        current_ym = datetime.now().strftime("%Y-%m")
+        cur = by_month.get(current_ym, {"This Month": 0.0, "Advance": 0.0,
+                                         "Arrears": 0.0, "Bonus": 0.0, "Other": 0.0})
+
+        this_month_paid = cur["This Month"]
+        advance_paid    = cur["Advance"]
+        bonus_paid      = cur["Bonus"]
+        other_paid      = cur["Other"]
+
+        # This month's salary due = monthly salary minus (This Month + Advance)
+        # paid in this same month. Can go negative if overpaid.
+        remaining_this_month = round(monthly_salary - this_month_paid - advance_paid, 2)
+
+        # Old due accumulated from every earlier month that has payment
+        # history (This Month + Advance paid in that month vs that
+        # month's salary), clamped at 0 per month so an overpaid month
+        # doesn't wipe out dues from other months.
+        old_due_accumulated = 0.0
+        arrears_paid_total = 0.0
+        for ym, totals in by_month.items():
+            arrears_paid_total += totals["Arrears"]
+            if ym < current_ym:
+                month_covered = totals["This Month"] + totals["Advance"]
+                month_due = monthly_salary - month_covered
+                if month_due > 0:
+                    old_due_accumulated += month_due
+
+        old_due_remaining = round(max(0.0, old_due_accumulated - arrears_paid_total), 2)
+
+        # Total outstanding = unresolved old due + this month's unpaid portion
+        # (only the positive/unpaid portion counts toward balance; an
+        # overpayment this month is not auto-adjusted against old due).
+        balance = round(old_due_remaining + max(0.0, remaining_this_month), 2)
 
         return {
-            "monthly_salary": round(monthly_salary, 2),
-            "paid_this_month": round(paid_this_month, 2),
-            "balance": round(monthly_salary - paid_this_month, 2)
+            "monthly_salary":        round(monthly_salary, 2),
+            "paid_this_month":       round(this_month_paid, 2),
+            "advance_paid":          round(advance_paid, 2),
+            "remaining_this_month":  remaining_this_month,
+            "bonus_paid":            round(bonus_paid, 2),
+            "other_paid":            round(other_paid, 2),
+            "old_due_remaining":     old_due_remaining,
+            "arrears_paid_total":    round(arrears_paid_total, 2),
+            "balance":               balance,
         }
     except sqlite3.Error as e:
         print(f"[get_employee_salary_status] {e}")
-        return {"monthly_salary":0,"paid_this_month":0,"balance":0}
+        return {"monthly_salary":0,"paid_this_month":0,"advance_paid":0,
+                "remaining_this_month":0,"bonus_paid":0,"other_paid":0,
+                "old_due_remaining":0,"arrears_paid_total":0,"balance":0}
     finally:
         if conn: conn.close()
 
 
-# ==========================
-# DISTRIBUTOR PAYMENTS
-# ==========================
-
-def record_distributor_payment(distributor_id, distributor_name, amount,
-                               payment_type, payment_mode, notes=""):
-    try:
-        amount = float(amount)
-        if amount <= 0:
-            return False, "Amount must be greater than 0."
-    except (ValueError, TypeError):
-        return False, "Invalid amount."
-
-    if not distributor_id:
-        return False, "Please select a distributor."
-
+def get_employee_salary_ledger(employee_id):
+    """
+    Month-wise salary ledger — har mahine ke liye salary, paid
+    (This Month + Advance), Arrears, Bonus aur us mahine ka balance
+    alag-alag dikhata hai. Har mahina independently calculate hota hai
+    (requirement #5 — Monthly Salary Ledger).
+    Returns a list of dicts ordered oldest → newest.
+    """
     conn = None
     try:
         conn = get_connection()
         c = conn.cursor()
-        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        c.execute("""
-            INSERT INTO distributor_payments
-                (distributor_id, distributor_name, amount,
-                 payment_type, payment_date, payment_mode, notes)
-            VALUES (?,?,?,?,?,?,?)
-        """, (distributor_id, distributor_name, amount,
-              payment_type, now, payment_mode, notes))
-
-        # update distributor balance:
-        # "Payment Made" reduces what we owe them (-),
-        # "Payment Received" increases what we owe them (+) [rare, e.g. refund]
-        delta = -amount if payment_type == "Payment Made" else amount
-        c.execute("""
-            UPDATE distributors SET balance = balance + ? WHERE id=?
-        """, (delta, distributor_id))
-
-        conn.commit()
-        return True, c.lastrowid
-    except sqlite3.Error as e:
-        return False, f"Database error: {e}"
-    finally:
-        if conn: conn.close()
-
-
-def get_distributor_payments(date_from=None, date_to=None, distributor_id=None):
-    conn = None
-    try:
-        conn = get_connection()
-        c = conn.cursor()
-        q = "SELECT * FROM distributor_payments WHERE 1=1"
-        params = []
-        if date_from:
-            q += " AND DATE(payment_date) >= ?"; params.append(date_from)
-        if date_to:
-            q += " AND DATE(payment_date) <= ?"; params.append(date_to)
-        if distributor_id:
-            q += " AND distributor_id = ?"; params.append(distributor_id)
-        q += " ORDER BY payment_date DESC"
-        c.execute(q, params)
-        return c.fetchall()
-    except sqlite3.Error as e:
-        print(f"[get_distributor_payments] {e}"); return []
-    finally:
-        if conn: conn.close()
-
-
-def delete_distributor_payment(payment_id):
-    conn = None
-    try:
-        conn = get_connection()
-        c = conn.cursor()
-        c.execute("SELECT distributor_id, amount, payment_type FROM distributor_payments WHERE id=?",
-                  (payment_id,))
+        c.execute("SELECT salary FROM employees WHERE id=?", (employee_id,))
         row = c.fetchone()
-        if not row:
-            return False, f"No payment found with ID {payment_id}."
+        monthly_salary = float(row["salary"]) if row else 0.0
 
-        # reverse the balance change
-        delta = row["amount"] if row["payment_type"] == "Payment Made" else -row["amount"]
-        c.execute("UPDATE distributors SET balance = balance + ? WHERE id=?",
-                  (delta, row["distributor_id"]))
+        by_month = _fetch_monthly_period_totals(c, employee_id)
 
-        c.execute("DELETE FROM distributor_payments WHERE id=?", (payment_id,))
-        conn.commit()
-        return True, "Distributor payment record deleted and balance reversed."
+        ledger = []
+        for ym in sorted(by_month.keys()):
+            totals = by_month[ym]
+            covered = totals["This Month"] + totals["Advance"]
+            ledger.append({
+                "month":            ym,
+                "monthly_salary":   round(monthly_salary, 2),
+                "this_month_paid":  round(totals["This Month"], 2),
+                "advance_paid":     round(totals["Advance"], 2),
+                "arrears_paid":     round(totals["Arrears"], 2),
+                "bonus_paid":       round(totals["Bonus"], 2),
+                "balance":          round(monthly_salary - covered, 2),
+            })
+        return ledger
     except sqlite3.Error as e:
-        return False, f"Database error: {e}"
+        print(f"[get_employee_salary_ledger] {e}")
+        return []
     finally:
         if conn: conn.close()
 
@@ -320,19 +345,6 @@ def get_employees_for_payment():
         return c.fetchall()
     except sqlite3.Error as e:
         print(f"[get_employees_for_payment] {e}"); return []
-    finally:
-        if conn: conn.close()
-
-
-def get_distributors_for_payment():
-    conn = None
-    try:
-        conn = get_connection()
-        c = conn.cursor()
-        c.execute("SELECT id, name, phone, balance FROM distributors ORDER BY name")
-        return c.fetchall()
-    except sqlite3.Error as e:
-        print(f"[get_distributors_for_payment] {e}"); return []
     finally:
         if conn: conn.close()
 
@@ -366,19 +378,14 @@ def get_payment_dashboard_summary():
         """)
         salary_paid_month = float(c.fetchone()[0])
 
-        # distributor balance owed (positive = we owe them)
-        c.execute("SELECT COALESCE(SUM(balance),0) FROM distributors WHERE balance > 0")
-        distributor_owed = float(c.fetchone()[0])
-
         return {
             "collected_today":     round(collected_today, 2),
             "total_customer_due":  round(total_customer_due, 2),
             "salary_paid_month":   round(salary_paid_month, 2),
-            "distributor_owed":    round(distributor_owed, 2)
         }
     except sqlite3.Error as e:
         print(f"[get_payment_dashboard_summary] {e}")
         return {"collected_today":0,"total_customer_due":0,
-                "salary_paid_month":0,"distributor_owed":0}
+                "salary_paid_month":0}
     finally:
         if conn: conn.close()
